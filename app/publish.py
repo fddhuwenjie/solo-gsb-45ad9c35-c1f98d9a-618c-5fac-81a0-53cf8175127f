@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from .exporter import export_openapi_fragment
-from .models import ParseError, PublishResponse, RouteIn
+from .models import (
+    AnalyzeResponse,
+    Conflict,
+    ExportOpenApiResponse,
+    ParseError,
+    PublishResponse,
+    RouteIn,
+)
 from .service import analyze_routes
 
 #: 覆盖状态文件路径的环境变量名。
@@ -53,6 +60,35 @@ def _merge_parse_errors(
             merged.append(error)
     merged.sort(key=lambda e: e.index)
     return merged
+
+
+@dataclass(frozen=True)
+class CandidateValidation:
+    """候选路由集的校验结果；与当前活动状态无关，可复用于只读预检。"""
+
+    audit: AnalyzeResponse
+    export: ExportOpenApiResponse
+    parse_errors: list[ParseError]
+    full_shadows: list[Conflict]
+
+    @property
+    def ok(self) -> bool:
+        """无解析错误（含导出路径重复）且无 full_shadow 时才允许发布/比较。"""
+        return not self.parse_errors and not self.full_shadows
+
+
+def validate_candidate(routes: list[RouteIn]) -> CandidateValidation:
+    """对候选集运行与 /analyze、/export-openapi 完全相同的审计与导出校验。"""
+    audit = analyze_routes(routes)
+    export = export_openapi_fragment(routes)
+    parse_errors = _merge_parse_errors(export.parse_errors, audit.parse_errors)
+    full_shadows = [c for c in audit.conflicts if c.kind == "full_shadow"]
+    return CandidateValidation(
+        audit=audit,
+        export=export,
+        parse_errors=parse_errors,
+        full_shadows=full_shadows,
+    )
 
 
 class PublishStore:
@@ -114,17 +150,13 @@ class PublishStore:
     ) -> PublishResponse:
         """校验候选集并在版本匹配时原子替换活动版本。"""
         # 校验与状态无关，在锁外完成：同一候选集上跑审计与导出。
-        audit = analyze_routes(routes)
-        export = export_openapi_fragment(routes)
-
-        parse_errors = _merge_parse_errors(export.parse_errors, audit.parse_errors)
-        full_shadows = [c for c in audit.conflicts if c.kind == "full_shadow"]
-        if parse_errors or full_shadows:
+        validation = validate_candidate(routes)
+        if not validation.ok:
             return PublishResponse(
                 status="rejected",
                 version=self._snapshot.version,
-                parse_errors=parse_errors,
-                conflicts=full_shadows,
+                parse_errors=validation.parse_errors,
+                conflicts=validation.full_shadows,
             )
 
         with self._lock:
@@ -136,8 +168,8 @@ class PublishStore:
             snapshot = Snapshot(
                 version=current.version + 1,
                 routes=[r.model_dump(mode="json") for r in routes],
-                audit=audit.model_dump(mode="json"),
-                openapi_paths=export.paths,
+                audit=validation.audit.model_dump(mode="json"),
+                openapi_paths=validation.export.paths,
             )
             # 先落盘成功再切换内存快照；落盘失败时活动版本保持不变。
             self._persist(snapshot)

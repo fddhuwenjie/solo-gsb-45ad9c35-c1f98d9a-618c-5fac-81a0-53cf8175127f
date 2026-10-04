@@ -235,3 +235,72 @@ class ActiveResponse(BaseModel):
         default_factory=dict,
         description="发布时生成的可嵌入 OpenAPI 3.1 的 paths 片段",
     )
+
+
+class SampleIn(BaseModel):
+    method: str = Field(..., description="HTTP 方法，如 GET / POST（大小写不敏感）")
+    path: str = Field(..., description="绝对路径，如 /users/42（必须以 '/' 开头）")
+
+    model_config = {"extra": "ignore"}
+
+
+class PrecheckRequest(BaseModel):
+    routes: list[RouteIn] = Field(
+        ..., description="按注册顺序排列的候选路由（与 /publish 同构）"
+    )
+    samples: list[SampleIn] = Field(
+        ..., description="请求样本（方法 + 绝对路径），结果按相同顺序返回"
+    )
+
+
+class AttributionHit(BaseModel):
+    index: int = Field(description="命中路由在对应路由数组中的原始下标")
+    id: str = Field(description="命中路由的有效 id（显式 id 或生成的 route-<下标>）")
+    normalized_template: str = Field(description="命中路由的规范化模板")
+
+
+class SampleAttribution(BaseModel):
+    index: int = Field(description="样本在输入数组中的原始下标")
+    method: str = Field(description="大写规范化后的方法回显")
+    path: str = Field(description="原始路径回显")
+    normalized_path: Optional[str] = Field(
+        default=None, description="规范化后的路径；路径非法时为 null"
+    )
+    active: Optional[AttributionHit] = Field(
+        default=None, description="活动快照侧的唯一命中路由；无命中为 null"
+    )
+    candidate: Optional[AttributionHit] = Field(
+        default=None, description="候选路由侧的唯一命中路由；无命中为 null"
+    )
+    changed: Optional[bool] = Field(
+        default=None,
+        description="是否改投：两侧命中路由的身份（方法、规范化模板、显式 id）"
+        "不一致，或仅一侧有命中；样本存在错误时为 null",
+    )
+    errors: list[str] = Field(
+        default_factory=list,
+        description="样本级错误（非法方法/路径）；非空时该样本不做归属比较",
+    )
+
+
+PrecheckStatus = Literal["compared", "rejected"]
+
+
+class PrecheckResponse(BaseModel):
+    status: PrecheckStatus = Field(
+        description="compared=候选通过校验并完成归属比较；rejected=候选未通过 "
+        "/publish 同款校验，整批不做归属比较"
+    )
+    version: int = Field(description="本次比较所固定的活动快照版本号")
+    parse_errors: list[ParseError] = Field(
+        default_factory=list,
+        description="rejected 时：候选路由的解析错误/重复导出路径（含原始下标）",
+    )
+    conflicts: list[Conflict] = Field(
+        default_factory=list,
+        description="rejected 时：候选路由的 full_shadow 冲突（含双方原始下标）",
+    )
+    results: list[SampleAttribution] = Field(
+        default_factory=list,
+        description="compared 时：与 samples 等长、同序的逐样本归属比较",
+    )

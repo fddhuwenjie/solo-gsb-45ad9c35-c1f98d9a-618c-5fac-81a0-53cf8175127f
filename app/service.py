@@ -110,7 +110,10 @@ def _render_witness(segments: list[str]) -> str:
     return render(segments)
 
 
-def analyze_routes(items: list[RouteIn]) -> AnalyzeResponse:
+def parse_route_items(
+    items: list[RouteIn],
+) -> tuple[list[ParseError], list[analyzer.Route]]:
+    """校验方法并解析模板；返回（解析错误，有效路由），下标均对应输入数组。"""
     parse_errors: list[ParseError] = []
     valid: list[analyzer.Route] = []
 
@@ -156,6 +159,12 @@ def analyze_routes(items: list[RouteIn]) -> AnalyzeResponse:
                 order_in_method=order,
             )
         )
+
+    return parse_errors, valid
+
+
+def analyze_routes(items: list[RouteIn]) -> AnalyzeResponse:
+    parse_errors, valid = parse_route_items(items)
 
     # 同方法分组（保持注册顺序）。
     groups: dict[str, list[analyzer.Route]] = {}

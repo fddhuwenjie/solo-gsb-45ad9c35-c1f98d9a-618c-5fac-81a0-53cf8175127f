@@ -27,6 +27,13 @@ URL 解码与规范化模型上模拟路由器匹配，判定：
 - `GET /active`：从**同一快照**返回当前活动版本的路由、审计结果与 OpenAPI
   `paths`；状态落盘保存，容器重启后仍可读到已发布版本。初始版本为 0、路由为空。
 
+最后是一个**只读预检**端点：
+
+- `POST /precheck`：提交候选路由与一批请求样本（方法 + 绝对路径），在**固定的
+  活动快照**上比较每个样本在「活动路由 vs 候选路由」下分别命中哪条路由——
+  候选须先通过与 `/publish` 完全相同的校验，通过时逐样本返回规范化路径、两侧
+  命中路由的原始下标 / id / 规范化模板以及是否改投；预检不修改活动配置。
+
 结果按「胜方优先级 → 方法 → 胜方规范化路径 → 原始下标」稳定排序。
 
 ---
@@ -532,6 +539,130 @@ curl -s http://localhost:8000/active
 `ROUTE_AUDIT_STATE_FILE` 覆盖；Compose 部署下为卷内的 `/data/active.json`），
 进程/容器重启后从同一文件恢复，读取永远返回同一版本的完整快照。
 
+### `POST /precheck`
+
+**只读**预检：比较一批请求样本在「当前活动路由」与「候选路由」下分别会命中
+哪条路由。端点**先固定当前活动快照**（版本 + 路由），整个比较都基于这同一份
+快照；预检本身不修改活动配置，之后 `/publish` 对过期的 `expected_version`
+仍按原规则拒绝。
+
+处理流程：
+
+1. 候选路由集先通过与 `/publish` **完全相同**的校验：任一解析错误、导出路径
+   重复或 `full_shadow` → `status: "rejected"`，返回含原始下标的
+   `parse_errors` / `conflicts`，**整批不做归属比较**（`results` 为空）；
+2. 校验通过时逐样本匹配：样本路径按与审计相同的解码/规范化规则处理
+   （`%2F` 不会变成段分隔符），再分别在两套路由中按「优先级降序、同级注册
+   先后」选出**唯一命中**；
+3. 路由身份按**方法、规范化模板、显式 id** 判定：同一条路由在候选中移动了
+   注册下标、或调整了优先级，都不算改投。
+
+请求体（`routes` 与 `/publish` 同构、按注册顺序排列；`samples` 为方法 +
+绝对路径的请求样本）：
+
+```json
+{
+  "routes": [
+    {"method": "GET", "path": "/users/{id:int}", "priority": 5, "id": "user"},
+    {"method": "GET", "path": "/assets/**", "id": "assets"},
+    {"method": "GET", "path": "/assets/logo.png", "priority": 10, "id": "logo"}
+  ],
+  "samples": [
+    {"method": "GET", "path": "/users/42"},
+    {"method": "GET", "path": "/assets/logo.png"},
+    {"method": "GET", "path": "/assets/css/site.css"},
+    {"method": "POST", "path": "/users/42"}
+  ]
+}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/precheck \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"method": "GET", "path": "/users/{id:int}", "priority": 5, "id": "user"},
+      {"method": "GET", "path": "/assets/**", "id": "assets"},
+      {"method": "GET", "path": "/assets/logo.png", "priority": 10, "id": "logo"}
+    ],
+    "samples": [
+      {"method": "GET", "path": "/users/42"},
+      {"method": "GET", "path": "/assets/logo.png"},
+      {"method": "GET", "path": "/assets/css/site.css"},
+      {"method": "POST", "path": "/users/42"}
+    ]
+  }'
+```
+
+响应（`results` 与 `samples` 等长、同序；`version` 为所固定快照的版本；
+假设活动版本 1 中只有 `user` 与 `assets` 两条路由）：
+
+```json
+{
+  "status": "compared",
+  "version": 1,
+  "parse_errors": [],
+  "conflicts": [],
+  "results": [
+    {"index": 0, "method": "GET", "path": "/users/42",
+     "normalized_path": "/users/42",
+     "active": {"index": 0, "id": "user",
+                "normalized_template": "/users/{id:int}"},
+     "candidate": {"index": 0, "id": "user",
+                   "normalized_template": "/users/{id:int}"},
+     "changed": false, "errors": []},
+    {"index": 1, "method": "GET", "path": "/assets/logo.png",
+     "normalized_path": "/assets/logo.png",
+     "active": {"index": 1, "id": "assets",
+                "normalized_template": "/assets/**"},
+     "candidate": {"index": 2, "id": "logo",
+                   "normalized_template": "/assets/logo.png"},
+     "changed": true, "errors": []},
+    {"index": 2, "method": "GET", "path": "/assets/css/site.css",
+     "normalized_path": "/assets/css/site.css",
+     "active": {"index": 1, "id": "assets",
+                "normalized_template": "/assets/**"},
+     "candidate": {"index": 1, "id": "assets",
+                   "normalized_template": "/assets/**"},
+     "changed": false, "errors": []},
+    {"index": 3, "method": "POST", "path": "/users/42",
+     "normalized_path": "/users/42",
+     "active": null, "candidate": null,
+     "changed": false, "errors": []}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `compared`（候选通过校验并完成比较）/ `rejected`（候选未通过 `/publish` 同款校验，整批不比较） |
+| `version` | 本次比较所固定的活动快照版本号 |
+| `parse_errors[]` / `conflicts[]` | rejected 时：候选路由的解析错误/重复导出路径与 `full_shadow` 冲突（含原始下标），含义同 `/publish` |
+| `results[]` | compared 时逐样本的归属比较，与 `samples` 等长、同序 |
+
+`results[]` 每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 样本在输入数组中的原始下标 |
+| `method` / `path` | 大写规范化后的方法 / 原始路径回显 |
+| `normalized_path` | 规范化后的样本路径；路径非法时为 `null` |
+| `active` / `candidate` | 两侧的唯一命中路由 `{index, id, normalized_template}`（`index` 为各自路由数组中的原始下标）；**无命中明确记为 `null`** |
+| `changed` | 是否改投；样本存在错误时为 `null` |
+| `errors[]` | 样本级错误（非法方法/路径），逐项报告、不影响其余样本 |
+
+`changed` 判定规则：
+
+- 两侧命中路由的（方法、规范化模板、显式 id）完全一致 → `false`
+  （同一条路由在候选中移动下标不算改投）；
+- 仅一侧有命中 → `true`；两侧都无命中 → `false`；
+- 命中路由的身份不一致 → `true`。
+
+非法样本（不支持的方法、非 `/` 开头的路径、非法百分号转义等）逐项记入
+`errors`，该样本的 `active` / `candidate` / `changed` 为 `null`，其余样本
+继续正常比较；`%2F` 在样本中始终是单段字面量，不会变成段分隔符。
+信封级校验失败（如缺少 `samples`）返回 **422**，与其它端点一致。
+
 ---
 
 ## “不可证实”（unprovable）是什么意思？
@@ -569,12 +700,13 @@ app/
   service.py         # 编排：解析分组、成对判定、稳定排序、建议顺序、汇总
   exporter.py        # 路由配置 -> OpenAPI 3.1 paths 片段（参数 schema、operationId）
   render.py          # 按模板与参数值反向生成 canonical path（约束校验、单段编码）
-  publish.py         # 活动版本存储：发布校验、CAS 替换、原子落盘与重启恢复
+  publish.py         # 活动版本存储：候选校验、CAS 替换、原子落盘与重启恢复
+  compare.py         # 只读预检：固定活动快照，比较样本在两侧的路由归属
   models.py          # Pydantic 请求/响应模型
   main.py            # FastAPI 路由：/analyze、/export-openapi、/render-paths、
-                     # /publish、/active、/healthz
+                     # /publish、/active、/precheck、/healthz
 tests/               # pytest 测试（规范化、模板、相交、API、导出、反向渲染、
-                     # 发布/活动版本、unprovable）
+                     # 发布/活动版本、归属预检、unprovable）
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .compare import compare_attribution
 from .exporter import export_openapi_fragment
 from .models import (
     ActiveResponse,
@@ -11,6 +12,8 @@ from .models import (
     AnalyzeResponse,
     ExportOpenApiRequest,
     ExportOpenApiResponse,
+    PrecheckRequest,
+    PrecheckResponse,
     PublishRequest,
     PublishResponse,
     RenderPathsRequest,
@@ -27,7 +30,8 @@ app = FastAPI(
         "并构造最短稳定的示例路径；也可把路由配置导出为可嵌入 OpenAPI 3.1 的 "
         "paths 片段，或按模板与参数值反向生成可调用的 canonical path。"
         "支持把校验通过的路由配置发布为可持久化的活动版本（CAS 递增），"
-        "并从同一快照读取路由、审计结果与 OpenAPI paths。"
+        "并从同一快照读取路由、审计结果与 OpenAPI paths；"
+        "还可在固定活动快照上只读预检候选路由，比较样本请求在两侧的归属。"
     ),
     version="1.0.0",
 )
@@ -75,3 +79,11 @@ def active() -> ActiveResponse:
         audit=snapshot.audit,
         openapi_paths=snapshot.openapi_paths,
     )
+
+
+@app.post("/precheck", response_model=PrecheckResponse, tags=["precheck"])
+def precheck(request: PrecheckRequest) -> PrecheckResponse:
+    """只读预检：固定当前活动快照，比较样本请求在活动与候选路由下的归属。"""
+    # 先固定活动快照：版本与活动路由在整个比较期间保持一致，且不修改活动配置。
+    snapshot = store.get()
+    return compare_attribution(snapshot, request.routes, request.samples)

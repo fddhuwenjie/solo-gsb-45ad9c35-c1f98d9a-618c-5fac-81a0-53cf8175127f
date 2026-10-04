@@ -25,7 +25,10 @@ URL 解码与规范化模型上模拟路由器匹配，判定：
 - `POST /publish`：对候选路由集同时运行冲突审计与 OpenAPI 导出，校验通过且
   `expected_version` 等于当前版本时**原子替换**活动路由并递增版本（CAS）；
 - `GET /active`：从**同一快照**返回当前活动版本的路由、审计结果与 OpenAPI
-  `paths`；状态落盘保存，容器重启后仍可读到已发布版本。初始版本为 0、路由为空。
+  `paths`；状态落盘保存，容器重启后仍可读到已发布版本。初始版本为 0、路由为空；
+- `POST /compare`：**只读预检**——提交候选路由与请求样本，先固定一次活动快照，
+  再比较每个样本在活动与候选路由下的**归属**（命中哪条路由、是否改投）；
+  候选必须通过与 `/publish` 完全相同的校验，预检不修改活动配置。
 
 结果按「胜方优先级 → 方法 → 胜方规范化路径 → 原始下标」稳定排序。
 
@@ -532,6 +535,171 @@ curl -s http://localhost:8000/active
 `ROUTE_AUDIT_STATE_FILE` 覆盖；Compose 部署下为卷内的 `/data/active.json`），
 进程/容器重启后从同一文件恢复，读取永远返回同一版本的完整快照。
 
+### `POST /compare`
+
+**只读**地比较请求样本在**活动路由**与一组**候选路由**下的归属。典型用途：
+发布前预演「这些真实请求在新路由集下会打到哪条路由、哪些会改投」。
+
+处理顺序：
+
+1. **先固定活动快照**：整个请求始终基于同一版本的活动路由，返回的 `version`
+   即该快照版本；
+2. 对候选运行与 `/publish` **完全相同**的校验（审计解析错误、OpenAPI 导出
+   路径重复、`full_shadow`）。任一不通过 → `status: "rejected"`，返回原始下标
+   与冲突，**整批不做归属比较**（`results` 为 `null`）；
+3. 候选有效时，逐样本按现有的解码、规范化、参数约束与末尾 `**` 规则匹配；
+   两侧都按**优先级降序、同级注册先后**选唯一命中；
+4. 按输入顺序返回规范化路径、两侧命中路由的原始下标、id、规范化模板与
+   `rerouted`；无命中明确记为 `null`；
+5. 归属按**方法 + 规范化模板 + 显式 id** 判定——仅原始下标移动不算改投；
+6. 非法方法或路径逐项报错（其余样本继续），`%2F` 不会变成段分隔符。
+
+预检**不修改活动配置**；之后 `/publish` 对过期的 `expected_version` 仍按原规则
+返回 `version_conflict`。
+
+请求体：
+
+```json
+{
+  "routes": [
+    {"method": "GET", "path": "/api/users/{id:int}", "priority": 5,  "id": "user"},
+    {"method": "GET", "path": "/api/**",               "priority": 0,  "id": "catchall"},
+    {"method": "GET", "path": "/api/users/me",         "priority": 10, "id": "me"},
+    {"method": "GET", "path": "/api/health",           "priority": 5,  "id": "health"}
+  ],
+  "samples": [
+    {"method": "GET", "path": "/api/users/1"},
+    {"method": "GET", "path": "/api/health"},
+    {"method": "GET", "path": "/api/a%2Fb"},
+    {"method": "GET", "path": "/nowhere"},
+    {"method": "BREW", "path": "/api/x"},
+    {"method": "GET", "path": "not-absolute"}
+  ]
+}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "routes": [
+      {"method": "GET", "path": "/api/users/{id:int}", "priority": 5,  "id": "user"},
+      {"method": "GET", "path": "/api/**",               "priority": 0,  "id": "catchall"},
+      {"method": "GET", "path": "/api/users/me",         "priority": 10, "id": "me"},
+      {"method": "GET", "path": "/api/health",           "priority": 5,  "id": "health"}
+    ],
+    "samples": [
+      {"method": "get", "path": "/api/users/1/"},
+      {"method": "GET", "path": "/api/health"},
+      {"method": "GET", "path": "/api/a%2Fb"},
+      {"method": "GET", "path": "/nowhere"}
+    ]
+  }'
+```
+
+候选有效时（`status: "compared"`；活动侧当前版本为 1，路由为
+`catchall` / `user` / `me`）：
+
+```json
+{
+  "status": "compared",
+  "version": 1,
+  "parse_errors": [],
+  "conflicts": [],
+  "results": [
+    {
+      "index": 0, "method": "GET", "path": "/api/users/1/",
+      "normalized_path": "/api/users/1",
+      "active":    {"index": 1, "id": "user",      "normalized_template": "/api/users/{id:int}"},
+      "candidate": {"index": 0, "id": "user",      "normalized_template": "/api/users/{id:int}"},
+      "rerouted": false,
+      "errors": []
+    },
+    {
+      "index": 1, "method": "GET", "path": "/api/health",
+      "normalized_path": "/api/health",
+      "active":    {"index": 0, "id": "catchall",  "normalized_template": "/api/**"},
+      "candidate": {"index": 3, "id": "health",    "normalized_template": "/api/health"},
+      "rerouted": true,
+      "errors": []
+    },
+    {
+      "index": 2, "method": "GET", "path": "/api/a%2Fb",
+      "normalized_path": "/api/a%2Fb",
+      "active":    {"index": 0, "id": "catchall",  "normalized_template": "/api/**"},
+      "candidate": {"index": 1, "id": "catchall",  "normalized_template": "/api/**"},
+      "rerouted": false,
+      "errors": []
+    },
+    {
+      "index": 3, "method": "GET", "path": "/nowhere",
+      "normalized_path": "/nowhere",
+      "active":    {"index": null, "id": null, "normalized_template": null},
+      "candidate": {"index": null, "id": null, "normalized_template": null},
+      "rerouted": false,
+      "errors": []
+    }
+  ]
+}
+```
+
+要点：
+
+- 样本 0 中 `user` 在候选数组的下标由 1 变为 0，但方法、规范化模板与显式 id
+  都相同，`rerouted` 为 **false**（不因下标移动误报）；
+- 样本 1 从 `catchall` 改投到新增的 `health`，`rerouted` 为 **true**；
+- 样本 2 的 `%2F` 保留在同一段内，不会切出额外段；
+- 样本 4（无命中）两侧三个字段均为 `null`。
+
+非法样本逐项报错、其余继续：
+
+```json
+{
+  "index": 4, "method": "BREW", "path": "/api/x",
+  "normalized_path": null, "active": null, "candidate": null,
+  "rerouted": null,
+  "errors": [{"code": "invalid_method", "message": "unsupported HTTP method 'BREW'"}]
+}
+```
+
+候选未通过校验时（结构与 `/publish` 的 rejected 一致；`results` 为 `null`，
+不做任何归属比较）：
+
+```json
+{
+  "status": "rejected",
+  "version": 1,
+  "parse_errors": [
+    {"index": 1, "id": null, "method": "GET", "template": "/x/{id:uuid}",
+     "error": "duplicate route: GET /x/{id} already exported from index 0; keeping the first registration"}
+  ],
+  "conflicts": [
+    {"winner_index": 2, "loser_index": 3, "kind": "full_shadow",
+     "winner_id": "all", "loser_id": "a", "witness_path": "/files/a"}
+  ],
+  "results": null
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | `compared`（已完成逐样本比较）/ `rejected`（候选未过校验，整批不比较） |
+| `version` | 本次固定的活动快照版本（预检不修改活动配置） |
+| `parse_errors[]` | rejected 时：审计与导出两侧的解析错误/重复导出路径（含原始下标） |
+| `conflicts[]` | rejected 时：审计发现的 `full_shadow` 冲突（含双方原始下标与 witness） |
+| `results[]` | 按输入顺序的逐样本结果；rejected 时为 `null` |
+
+`results[]` 每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 样本在输入 `samples` 中的原始下标 |
+| `method` / `path` | 规范化（大写）后的方法与样本原始路径；方法非法时回显原值 |
+| `normalized_path` | 现有解码/规范化后的请求路径；样本非法时为 `null` |
+| `active` / `candidate` | 两侧命中：`index`（该侧原始下标）、`id`（生效 id）、`normalized_template`；无命中三者皆 `null` |
+| `rerouted` | 按方法 + 规范化模板 + 显式 id 判定归属是否改变；样本非法时为 `null` |
+| `errors[]` | 该样本的逐项错误：`invalid_method` / `invalid_path` |
+
 ---
 
 ## “不可证实”（unprovable）是什么意思？
@@ -570,9 +738,11 @@ app/
   exporter.py        # 路由配置 -> OpenAPI 3.1 paths 片段（参数 schema、operationId）
   render.py          # 按模板与参数值反向生成 canonical path（约束校验、单段编码）
   publish.py         # 活动版本存储：发布校验、CAS 替换、原子落盘与重启恢复
+  matching.py        # 已发布/候选路由编译与样本唯一命中（优先级、注册顺序决胜）
+  compare.py         # /compare 编排：固定快照、候选校验、两侧归属与改投判定
   models.py          # Pydantic 请求/响应模型
   main.py            # FastAPI 路由：/analyze、/export-openapi、/render-paths、
-                     # /publish、/active、/healthz
+                     # /publish、/active、/compare、/healthz
 tests/               # pytest 测试（规范化、模板、相交、API、导出、反向渲染、
                      # 发布/活动版本、unprovable）
 Dockerfile

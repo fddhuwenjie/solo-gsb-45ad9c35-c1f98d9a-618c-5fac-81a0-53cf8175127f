@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .compare import compare_attribution
 from .exporter import export_openapi_fragment
 from .models import (
     ActiveResponse,
     AnalyzeRequest,
     AnalyzeResponse,
+    CompareRequest,
+    CompareResponse,
     ExportOpenApiRequest,
     ExportOpenApiResponse,
     PublishRequest,
@@ -75,3 +78,13 @@ def active() -> ActiveResponse:
         audit=snapshot.audit,
         openapi_paths=snapshot.openapi_paths,
     )
+
+
+@app.post("/compare", response_model=CompareResponse, tags=["publish"])
+def compare(request: CompareRequest) -> CompareResponse:
+    """只读预检：固定活动快照后，比较样本请求在活动与候选路由下的归属。
+
+    候选须通过与 /publish 相同的校验；预检不修改活动配置，返回所固定
+    快照的版本号。
+    """
+    return compare_attribution(store, request)

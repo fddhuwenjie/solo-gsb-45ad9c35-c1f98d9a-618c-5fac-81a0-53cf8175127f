@@ -235,3 +235,97 @@ class ActiveResponse(BaseModel):
         default_factory=dict,
         description="发布时生成的可嵌入 OpenAPI 3.1 的 paths 片段",
     )
+
+
+# --------------------------------------------------------------------------- #
+# POST /compare：样本请求在活动与候选路由下的只读归属比较
+# --------------------------------------------------------------------------- #
+
+
+class SampleRequest(BaseModel):
+    method: str = Field(..., description="HTTP 方法（大小写不敏感）")
+    path: str = Field(..., description="绝对请求路径，如 /users/1 或 /a%2Fb")
+
+    model_config = {"extra": "ignore"}
+
+
+class CompareRequest(BaseModel):
+    routes: list[RouteIn] = Field(
+        ..., description="按注册顺序排列的候选路由（与 /publish 请求同构）"
+    )
+    samples: list[SampleRequest] = Field(
+        ..., description="有方法与绝对路径的请求样本，结果按相同顺序返回"
+    )
+
+
+class SampleError(BaseModel):
+    code: str = Field(description="invalid_method=方法不支持；invalid_path=路径非法")
+    message: str
+
+
+class RouteMatch(BaseModel):
+    index: Optional[int] = Field(
+        default=None,
+        description="命中路由在该侧路由数组中的原始下标；无命中为 null",
+    )
+    id: Optional[str] = Field(
+        default=None,
+        description="命中路由的生效 id（显式 id 或 route-<下标>）；无命中为 null",
+    )
+    normalized_template: Optional[str] = Field(
+        default=None, description="命中路由的规范化模板；无命中为 null"
+    )
+
+
+class SampleResult(BaseModel):
+    index: int = Field(..., description="样本在输入 samples 数组中的原始下标")
+    method: Optional[str] = Field(
+        default=None, description="规范化（大写）后的方法；样本非法时回显原值"
+    )
+    path: str = Field(..., description="样本原始绝对路径")
+    normalized_path: Optional[str] = Field(
+        default=None, description="规范化后的请求路径；样本非法时为 null"
+    )
+    active: Optional[RouteMatch] = Field(
+        default=None, description="活动快照侧命中；样本非法时为 null"
+    )
+    candidate: Optional[RouteMatch] = Field(
+        default=None, description="候选路由侧命中；样本非法时为 null"
+    )
+    rerouted: Optional[bool] = Field(
+        default=None,
+        description=(
+            "是否改投：按方法 + 规范化模板 + 显式 id 判定，仅下标移动不算；"
+            "样本非法时为 null"
+        ),
+    )
+    errors: list[SampleError] = Field(
+        default_factory=list, description="该样本的逐项错误（不影响其它样本）"
+    )
+
+
+CompareStatus = Literal["compared", "rejected"]
+
+
+class CompareResponse(BaseModel):
+    status: CompareStatus = Field(
+        description=(
+            "compared=候选通过 /publish 同套校验，已完成逐样本归属比较；"
+            "rejected=候选未通过校验，整批不做归属比较，results 为 null"
+        )
+    )
+    version: int = Field(
+        ...,
+        description="本次比较所固定的活动快照版本（只读预检，不修改活动配置）",
+    )
+    parse_errors: list[ParseError] = Field(
+        default_factory=list,
+        description="rejected 时：审计与导出两侧的解析错误/重复导出路径（含原始下标）",
+    )
+    conflicts: list[Conflict] = Field(
+        default_factory=list, description="rejected 时：审计发现的 full_shadow 冲突"
+    )
+    results: Optional[list[SampleResult]] = Field(
+        default=None,
+        description="按输入顺序排列的逐样本归属比较结果；rejected 时为 null",
+    )
